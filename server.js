@@ -55,6 +55,10 @@ async function authed(req, res, next) {
       const { data: au } = await admin.from("agency_users").select("agency_id, series").eq("profile_id", user.id).single();
       req.agency = au;
     }
+    if (profile.role === "supplier") {
+      const { data: su } = await admin.from("supplier_users").select("supplier_company_id, series").eq("profile_id", user.id).single();
+      req.supplier = su;
+    }
     next();
   } catch (e) { res.status(500).json({ error: e.message }); }
 }
@@ -145,9 +149,27 @@ app.post("/clients", authed, requireRole("agency"), async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ============================================================
-// FILE UPLOAD  (agency member of the project -> Google Drive -> files row)
-// ============================================================
+// Agency creates a supplier user (S + 6 digits) under one of its supplier companies.
+// The supplier company itself is created by the browser directly (RLS allows the agency);
+// only the login needs the service role, so it lives here.
+app.post("/supplier-users", authed, requireRole("agency"), async (req, res) => {
+  const { series, name, supplier_company_id, email, password } = req.body;
+  if (!/^S\d{6}$/.test(series || "")) return res.status(400).json({ error: "Series must be S + 6 digits" });
+  if (!name) return res.status(400).json({ error: "Name is required" });
+  try {
+    // the supplier company must belong to the calling agency
+    const { data: sc } = await admin.from("supplier_companies")
+      .select("id").eq("id", supplier_company_id).eq("owner_agency_id", req.agency.agency_id).maybeSingle();
+    if (!sc) return res.status(403).json({ error: "That supplier company isn't yours" });
+
+    const { data: created, error } = await admin.auth.admin.createUser({ email, password, email_confirm: true });
+    if (error) throw error;
+    const id = created.user.id;
+    await admin.from("profiles").insert({ id, role: "supplier", display_name: name });
+    await admin.from("supplier_users").insert({ profile_id: id, series, supplier_company_id });
+    res.json({ id, series, name });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
 app.post("/projects/:id/files", authed, requireRole("agency"), upload.single("file"), async (req, res) => {
   const projectId = req.params.id;
   const { description, type } = req.body;
@@ -202,19 +224,78 @@ app.post("/projects/:id/files", authed, requireRole("agency"), upload.single("fi
 });
 
 // ============================================================
+// AGENCY-PROJECT FILE UPLOAD  (the SUPPLIER uploads; the agency acknowledges)
+// Drive tree: _DISPATCHR / [AGENCY] / _SUPPLIERS / [SUPPLIER COMPANY] / [yyyymmdd Project]
+// ============================================================
+app.post("/agency-projects/:id/files", authed, requireRole("supplier"), upload.single("file"), async (req, res) => {
+  const apId = req.params.id;
+  const { description, type } = req.body;
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file" });
+    const { data: ap } = await admin.from("agency_projects")
+      .select("id, name, start_date, drive_folder_id, supplier_company_id, agencies(name), supplier_companies(name)")
+      .eq("id", apId).single();
+    if (!ap) return res.status(404).json({ error: "Project not found" });
+    // the uploader must belong to this project's supplier company
+    if (ap.supplier_company_id !== req.supplier?.supplier_company_id) {
+      return res.status(403).json({ error: "Not your supplier company's project" });
+    }
+
+    const drive = driveClient();
+    // One permanent folder per agency project, stored on first upload (renames never fork it).
+    let parent = ap.drive_folder_id;
+    if (!parent) {
+      const agencyName = (ap.agencies?.name || "UNKNOWN").toUpperCase();
+      const supplierName = ap.supplier_companies?.name || "SUPPLIER";
+      const root = await ensureFolder(drive, "_DISPATCHR", "root");
+      const agencyFolder = await ensureFolder(drive, agencyName, root);
+      const supRoot = await ensureFolder(drive, "_SUPPLIERS", agencyFolder);
+      const supFolder = await ensureFolder(drive, supplierName, supRoot);
+      const ymd = String(ap.start_date || "").replace(/-/g, "").slice(0, 8) || "00000000";
+      const created = await drive.files.create({
+        requestBody: { name: `${ymd} ${ap.name}`, mimeType: "application/vnd.google-apps.folder", parents: [supFolder] },
+        fields: "id",
+      });
+      parent = created.data.id;
+      await admin.from("agency_projects").update({ drive_folder_id: parent }).eq("id", apId);
+    }
+
+    const uploaded = await drive.files.create({
+      requestBody: { name: req.file.originalname, parents: [parent] },
+      media: { mimeType: req.file.mimetype, body: Readable.from(req.file.buffer) },
+      fields: "id, webViewLink",
+    });
+
+    const { data: row, error } = await admin.from("files").insert({
+      agency_project_id: apId, description, type: type || "Others",
+      file_name: req.file.originalname,
+      drive_file_id: uploaded.data.id, drive_link: uploaded.data.webViewLink,
+      uploaded_by: req.user.id,
+    }).select().single();
+    if (error) throw error;
+    res.json(row);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ============================================================
 // FILE DOWNLOAD  (access-checked broker -> streams bytes from Drive)
 // ============================================================
 app.get("/files/:id/download", authed, async (req, res) => {
   try {
-    // can the caller see the parent project? reuse the RLS helper
-    const { data: file } = await admin.from("files").select("project_id, file_name, drive_file_id").eq("id", req.params.id).single();
+    // can the caller see the parent project? reuse the RLS helpers, called AS the user
+    const { data: file } = await admin.from("files").select("project_id, agency_project_id, file_name, drive_file_id").eq("id", req.params.id).single();
     if (!file) return res.status(404).json({ error: "Not found" });
-    const { data: allowed } = await admin.rpc("can_see_project", { p: file.project_id });
-    // can_see_project uses auth.uid(); call it as the user instead:
     const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       global: { headers: { Authorization: req.headers.authorization } },
     });
-    const { data: ok } = await userClient.rpc("can_see_project", { p: file.project_id });
+    let ok = false;
+    if (file.project_id) {
+      const { data } = await userClient.rpc("can_see_project", { p: file.project_id });
+      ok = data;
+    } else if (file.agency_project_id) {
+      const { data } = await userClient.rpc("can_see_agency_project", { p: file.agency_project_id });
+      ok = data;
+    }
     if (!ok) return res.status(403).json({ error: "Forbidden" });
 
     const drive = driveClient();
