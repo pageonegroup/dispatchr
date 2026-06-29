@@ -159,14 +159,30 @@ app.post("/projects/:id/files", authed, requireRole("agency"), upload.single("fi
     if (!req.file) return res.status(400).json({ error: "No file" });
 
     const { data: project } = await admin.from("projects")
-      .select("id, name, client_id, clients(name)").eq("id", projectId).single();
+      .select("id, name, start_date, drive_folder_id, agencies(name)").eq("id", projectId).single();
 
     const drive = driveClient();
-    // resolve destination folder per the admin's folder-structure choice
-    let parent = DRIVE_ROOT_FOLDER_ID;
-    const structure = req.body.structure || "client"; // front-end can pass the configured value
-    if (structure === "client") parent = await ensureFolder(drive, project.clients.name, parent);
-    else if (structure === "project") parent = await ensureFolder(drive, project.name, parent);
+    // Each project gets ONE permanent folder. The first time a file is uploaded we create it
+    // and store its id on the project, then always reuse that id — so renaming the project or
+    // changing its date never moves or forks the files.
+    // Tree: _DISPATCHR / [AGENCY NAME, UPPERCASE] / [yyyymmdd Project Name]
+    let parent = project.drive_folder_id;
+    if (!parent) {
+      const agencyName = (project.agencies?.name || "UNKNOWN").toUpperCase();
+      const root = await ensureFolder(drive, "_DISPATCHR", "root");
+      const agencyFolder = await ensureFolder(drive, agencyName, root);
+      const ymd = String(project.start_date || "").replace(/-/g, "").slice(0, 8) || "00000000";
+      const created = await drive.files.create({
+        requestBody: {
+          name: `${ymd} ${project.name}`,
+          mimeType: "application/vnd.google-apps.folder",
+          parents: [agencyFolder],
+        },
+        fields: "id",
+      });
+      parent = created.data.id;
+      await admin.from("projects").update({ drive_folder_id: parent }).eq("id", projectId);
+    }
 
     const uploaded = await drive.files.create({
       requestBody: { name: req.file.originalname, parents: [parent] },
