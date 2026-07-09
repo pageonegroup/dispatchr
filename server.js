@@ -305,4 +305,163 @@ app.get("/files/:id/download", authed, async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// ============================================================
+// SUPER ADMIN — "god mode" over clients & suppliers (ANY agency)
+// The admin isn't tied to one agency, so every create takes an explicit
+// target agency_id / company id. All writes use the service role, so no
+// RLS changes are needed. Deletes are blocked while dependent rows exist.
+// ============================================================
+const NUM = /^[A-Za-z0-9]{1,12}$/; // matches the frontend's loosened number rule
+
+// ---- CLIENTS -------------------------------------------------
+// Create a client under any agency (series auto-generated, same C+yyyymm+seq rule)
+app.post("/admin/clients", authed, requireRole("super_admin"), async (req, res) => {
+  const { name, email, password, agency_id } = req.body;
+  if (!name || !email || !password || !agency_id)
+    return res.status(400).json({ error: "name, email, password and agency_id are required" });
+  try {
+    const d = new Date();
+    const ym = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}`;
+    const { count } = await admin.from("clients").select("*", { count: "exact", head: true }).like("series", `C${ym}%`);
+    const series = `C${ym}${String((count || 0) + 1).padStart(3, "0")}`;
+
+    const { data: created, error } = await admin.auth.admin.createUser({ email, password, email_confirm: true });
+    if (error) throw error;
+    const id = created.user.id;
+    await admin.from("profiles").insert({ id, role: "client", display_name: name });
+    await admin.from("clients").insert({ series, name, owner_agency_id: agency_id, profile_id: id, email, created_by: req.user.id });
+    res.json({ id, series, name });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Edit a client (name / email / owning agency / optional password reset)
+app.patch("/admin/clients/:id", authed, requireRole("super_admin"), async (req, res) => {
+  const { name, email, agency_id, password } = req.body;
+  try {
+    const { data: c } = await admin.from("clients").select("profile_id").eq("id", req.params.id).single();
+    if (!c) return res.status(404).json({ error: "Client not found" });
+    const patch = {};
+    if (name != null) patch.name = name;
+    if (email != null) patch.email = email;
+    if (agency_id != null) patch.owner_agency_id = agency_id;
+    if (Object.keys(patch).length) await admin.from("clients").update(patch).eq("id", req.params.id);
+    if (name != null) await admin.from("profiles").update({ display_name: name }).eq("id", c.profile_id);
+    if (email != null || password)
+      await admin.auth.admin.updateUserById(c.profile_id, { ...(email != null ? { email } : {}), ...(password ? { password } : {}) });
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Delete a client (blocked while it still has projects)
+app.delete("/admin/clients/:id", authed, requireRole("super_admin"), async (req, res) => {
+  try {
+    const { data: c } = await admin.from("clients").select("profile_id").eq("id", req.params.id).single();
+    if (!c) return res.status(404).json({ error: "Client not found" });
+    const { count } = await admin.from("projects").select("*", { count: "exact", head: true }).eq("client_id", req.params.id);
+    if (count > 0) return res.status(409).json({ error: `This client still has ${count} project(s). Delete or reassign those first.` });
+    await admin.from("clients").delete().eq("id", req.params.id);
+    await admin.auth.admin.deleteUser(c.profile_id); // removes the login; profile cascades
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ---- SUPPLIER COMPANIES -------------------------------------
+// Create a supplier company under any agency
+app.post("/admin/supplier-companies", authed, requireRole("super_admin"), async (req, res) => {
+  const { name, agency_id } = req.body;
+  if (!name || !agency_id) return res.status(400).json({ error: "name and agency_id are required" });
+  try {
+    const { data, error } = await admin.from("supplier_companies").insert({ name, owner_agency_id: agency_id }).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Edit a supplier company (rename / move to another agency)
+app.patch("/admin/supplier-companies/:id", authed, requireRole("super_admin"), async (req, res) => {
+  const { name, agency_id } = req.body;
+  try {
+    const patch = {};
+    if (name != null) patch.name = name;
+    if (agency_id != null) patch.owner_agency_id = agency_id;
+    if (!Object.keys(patch).length) return res.json({ ok: true });
+    const { error } = await admin.from("supplier_companies").update(patch).eq("id", req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Delete a supplier company (blocked while it has users or agency projects)
+app.delete("/admin/supplier-companies/:id", authed, requireRole("super_admin"), async (req, res) => {
+  try {
+    const { count: users } = await admin.from("supplier_users").select("*", { count: "exact", head: true }).eq("supplier_company_id", req.params.id);
+    if (users > 0) return res.status(409).json({ error: `This company still has ${users} supplier user(s). Delete those first.` });
+    const { count: aps } = await admin.from("agency_projects").select("*", { count: "exact", head: true }).eq("supplier_company_id", req.params.id);
+    if (aps > 0) return res.status(409).json({ error: `This company still has ${aps} agency project(s). Delete or reassign those first.` });
+    const { error } = await admin.from("supplier_companies").delete().eq("id", req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ---- SUPPLIER USERS -----------------------------------------
+// Create a supplier user under any company. Accepts either an existing
+// supplier_company_id, or a company name + agency_id to find-or-create.
+app.post("/admin/supplier-users", authed, requireRole("super_admin"), async (req, res) => {
+  let { series, name, supplier_company_id, supplier_company_name, agency_id, email, password } = req.body;
+  const num = (series || "").replace(/^S/, "");
+  if (!NUM.test(num)) return res.status(400).json({ error: "Series must be S + up to 12 letters or numbers" });
+  if (!name) return res.status(400).json({ error: "Name is required" });
+  if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
+  try {
+    // resolve the company: use the id if given, else find-or-create by name under agency_id
+    if (!supplier_company_id) {
+      if (!supplier_company_name || !agency_id)
+        return res.status(400).json({ error: "Provide supplier_company_id, or supplier_company_name + agency_id" });
+      const { data: found } = await admin.from("supplier_companies")
+        .select("id").eq("owner_agency_id", agency_id).ilike("name", supplier_company_name).maybeSingle();
+      if (found) supplier_company_id = found.id;
+      else {
+        const { data: made, error: mErr } = await admin.from("supplier_companies")
+          .insert({ name: supplier_company_name, owner_agency_id: agency_id }).select("id").single();
+        if (mErr) throw mErr;
+        supplier_company_id = made.id;
+      }
+    }
+    const { data: created, error } = await admin.auth.admin.createUser({ email, password, email_confirm: true });
+    if (error) throw error;
+    const id = created.user.id;
+    await admin.from("profiles").insert({ id, role: "supplier", display_name: name });
+    await admin.from("supplier_users").insert({ profile_id: id, series, supplier_company_id });
+    res.json({ id, series, name });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Edit a supplier user (name / company / optional email + password)
+app.patch("/admin/supplier-users/:profile_id", authed, requireRole("super_admin"), async (req, res) => {
+  const { name, supplier_company_id, email, password } = req.body;
+  try {
+    if (name != null) {
+      await admin.from("profiles").update({ display_name: name }).eq("id", req.params.profile_id);
+    }
+    if (supplier_company_id != null) {
+      await admin.from("supplier_users").update({ supplier_company_id }).eq("profile_id", req.params.profile_id);
+    }
+    if (email != null || password)
+      await admin.auth.admin.updateUserById(req.params.profile_id, { ...(email != null ? { email } : {}), ...(password ? { password } : {}) });
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Delete a supplier user (blocked while they have uploaded files)
+app.delete("/admin/supplier-users/:profile_id", authed, requireRole("super_admin"), async (req, res) => {
+  try {
+    const { count } = await admin.from("files").select("*", { count: "exact", head: true }).eq("uploaded_by", req.params.profile_id);
+    if (count > 0) return res.status(409).json({ error: `This supplier has uploaded ${count} file(s). Remove those first.` });
+    await admin.from("supplier_users").delete().eq("profile_id", req.params.profile_id);
+    await admin.auth.admin.deleteUser(req.params.profile_id); // removes login; profile cascades
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => console.log(`Dispatchr backend on :${PORT}`));
