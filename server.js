@@ -14,14 +14,21 @@ import { google } from "googleapis";
 import { Readable } from "node:stream";
 
 const {
-  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY,
+  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SECRET, SUPABASE_ANON_KEY,
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI,
   GOOGLE_REFRESH_TOKEN, DRIVE_ROOT_FOLDER_ID,
   ALLOWED_ORIGINS = "", PORT = 8080,
 } = process.env;
 
+// The service-role SECRET (bypasses RLS). Prefer SUPABASE_SECRET — set that fresh
+// on Railway; fall back to the old SUPABASE_SERVICE_ROLE_KEY if it's not present.
+const SERVICE_KEY = SUPABASE_SECRET || SUPABASE_SERVICE_ROLE_KEY;
+if (!SERVICE_KEY || String(SERVICE_KEY).startsWith("sb_publishable")) {
+  console.error("[Dispatchr] Service key looks WRONG — it must be the service_role secret (starts sb_secret_), NOT the publishable/anon key. Set SUPABASE_SECRET on Railway.");
+}
+
 // Service-role client: full access, bypasses RLS. Backend only.
-const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+const admin = createClient(SUPABASE_URL, SERVICE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 // Anon client: used only to resolve a caller's JWT into a user
@@ -78,6 +85,18 @@ async function ensureFolder(drive, name, parentId) {
 }
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// Safe self-check (exposes no secrets): confirms the service key is set correctly.
+// Visit https://<your-backend>/debug/service-key in a browser.
+app.get("/debug/service-key", async (_req, res) => {
+  const looksPublishable = String(SERVICE_KEY || "").startsWith("sb_publishable");
+  let canReadProfiles = false, profileCount = null, error = null;
+  try {
+    const r = await admin.from("profiles").select("*", { count: "exact", head: true });
+    if (r.error) error = r.error.message; else { canReadProfiles = true; profileCount = r.count; }
+  } catch (e) { error = e.message; }
+  res.json({ usingVar: SUPABASE_SECRET ? "SUPABASE_SECRET" : "SUPABASE_SERVICE_ROLE_KEY", looksPublishable, canReadProfiles, profileCount, error });
+});
 
 // ============================================================
 // GOOGLE DRIVE — one-time OAuth connect (run as super admin once)
