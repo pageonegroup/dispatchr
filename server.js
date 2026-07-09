@@ -439,14 +439,17 @@ app.post("/admin/supplier-users", authed, requireRole("super_admin"), async (req
 
 // Edit a supplier user (name / company / optional email + password)
 app.patch("/admin/supplier-users/:profile_id", authed, requireRole("super_admin"), async (req, res) => {
-  const { name, supplier_company_id, email, password } = req.body;
+  const { name, supplier_company_id, series, email, password } = req.body;
   try {
+    if (series != null && !NUM.test((series || "").replace(/^S/, "")))
+      return res.status(400).json({ error: "Series must be S + up to 12 letters or numbers" });
     if (name != null) {
       await admin.from("profiles").update({ display_name: name }).eq("id", req.params.profile_id);
     }
-    if (supplier_company_id != null) {
-      await admin.from("supplier_users").update({ supplier_company_id }).eq("profile_id", req.params.profile_id);
-    }
+    const suPatch = {};
+    if (supplier_company_id != null) suPatch.supplier_company_id = supplier_company_id;
+    if (series != null) suPatch.series = series;
+    if (Object.keys(suPatch).length) await admin.from("supplier_users").update(suPatch).eq("profile_id", req.params.profile_id);
     if (email != null || password)
       await admin.auth.admin.updateUserById(req.params.profile_id, { ...(email != null ? { email } : {}), ...(password ? { password } : {}) });
     res.json({ ok: true });
@@ -460,6 +463,43 @@ app.delete("/admin/supplier-users/:profile_id", authed, requireRole("super_admin
     if (count > 0) return res.status(409).json({ error: `This supplier has uploaded ${count} file(s). Remove those first.` });
     await admin.from("supplier_users").delete().eq("profile_id", req.params.profile_id);
     await admin.auth.admin.deleteUser(req.params.profile_id); // removes login; profile cascades
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ---- AGENCY USERS (edit / delete / password reset) ----------
+// Edit an agency user. Email is kept in both the login and agency_users.email.
+app.patch("/admin/agency-users/:profile_id", authed, requireRole("super_admin"), async (req, res) => {
+  const { name, agency_id, series, email, password } = req.body;
+  const pid = req.params.profile_id;
+  try {
+    if (series != null && !NUM.test((series || "").replace(/^A/, "")))
+      return res.status(400).json({ error: "Series must be A + up to 12 letters or numbers" });
+    if (name != null) await admin.from("profiles").update({ display_name: name }).eq("id", pid);
+    const auPatch = {};
+    if (agency_id != null) auPatch.agency_id = agency_id;
+    if (series != null) auPatch.series = series;
+    if (email != null) auPatch.email = email;
+    if (Object.keys(auPatch).length) await admin.from("agency_users").update(auPatch).eq("profile_id", pid);
+    if (email != null || password)
+      await admin.auth.admin.updateUserById(pid, { ...(email != null ? { email } : {}), ...(password ? { password } : {}) });
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Delete an agency user (blocked while they still own projects)
+app.delete("/admin/agency-users/:profile_id", authed, requireRole("super_admin"), async (req, res) => {
+  const pid = req.params.profile_id;
+  try {
+    const { count: cp } = await admin.from("projects").select("*", { count: "exact", head: true }).eq("created_by", pid);
+    const { count: cap } = await admin.from("agency_projects").select("*", { count: "exact", head: true }).eq("created_by", pid);
+    const owned = (cp || 0) + (cap || 0);
+    if (owned > 0) return res.status(409).json({ error: `This user created ${owned} project(s). Reassign or delete those first.` });
+    // remove their project memberships so the delete doesn't trip a foreign key
+    await admin.from("project_members").delete().eq("member_id", pid);
+    await admin.from("agency_project_members").delete().eq("member_id", pid);
+    await admin.from("agency_users").delete().eq("profile_id", pid);
+    await admin.auth.admin.deleteUser(pid); // removes login; profile cascades
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
