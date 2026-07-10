@@ -173,7 +173,7 @@ app.post("/supplier-users", authed, requireRole("agency"), async (req, res) => {
     if (error) throw error;
     const id = created.user.id;
     await admin.from("profiles").insert({ id, role: "supplier", display_name: name });
-    await admin.from("supplier_users").insert({ profile_id: id, series, supplier_company_id });
+    await admin.from("supplier_users").insert({ profile_id: id, series, supplier_company_id, email });
     res.json({ id, series, name });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -439,7 +439,7 @@ app.post("/admin/supplier-users", authed, requireRole("super_admin"), async (req
     if (error) throw error;
     const id = created.user.id;
     await admin.from("profiles").insert({ id, role: "supplier", display_name: name });
-    await admin.from("supplier_users").insert({ profile_id: id, series, supplier_company_id });
+    await admin.from("supplier_users").insert({ profile_id: id, series, supplier_company_id, email });
     res.json({ id, series, name });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -507,6 +507,125 @@ app.delete("/admin/agency-users/:profile_id", authed, requireRole("super_admin")
     await admin.from("agency_project_members").delete().eq("member_id", pid);
     await admin.from("agency_users").delete().eq("profile_id", pid);
     await admin.auth.admin.deleteUser(pid); // removes login; profile cascades
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ============================================================
+// AGENCY — create projects via the backend (service role, bypasses RLS)
+// ============================================================
+
+// Client project
+app.post("/projects", authed, requireRole("agency"), async (req, res) => {
+  const { name, start_date, client_id, slug, members } = req.body;
+  if (!name || !client_id) return res.status(400).json({ error: "name and client_id are required" });
+  try {
+    const row = { name, start_date: start_date || null, client_id, agency_id: req.agency.agency_id, created_by: req.user.id };
+    if (slug) row.slug = slug;
+    const { data: proj, error } = await admin.from("projects").insert(row).select().single();
+    if (error) throw error;
+    const mem = [...new Set([req.user.id, ...((members || []).filter(Boolean))])];
+    if (mem.length) {
+      const { error: mErr } = await admin.from("project_members").insert(mem.map(m => ({ project_id: proj.id, member_id: m })));
+      if (mErr) throw mErr;
+    }
+    res.json(proj);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Agency project (supplier side). Accepts an existing company id, or a company
+// name to find-or-create under the caller's agency.
+app.post("/agency-projects", authed, requireRole("agency"), async (req, res) => {
+  let { name, start_date, supplier_company_id, supplier_company_name, slug, members } = req.body;
+  if (!name) return res.status(400).json({ error: "name is required" });
+  try {
+    if (!supplier_company_id) {
+      if (!supplier_company_name) return res.status(400).json({ error: "Pick or name a supplier company" });
+      const { data: found } = await admin.from("supplier_companies")
+        .select("id").eq("owner_agency_id", req.agency.agency_id).ilike("name", supplier_company_name).maybeSingle();
+      if (found) supplier_company_id = found.id;
+      else {
+        const { data: made, error: cErr } = await admin.from("supplier_companies")
+          .insert({ name: supplier_company_name, owner_agency_id: req.agency.agency_id }).select("id").single();
+        if (cErr) throw cErr;
+        supplier_company_id = made.id;
+      }
+    }
+    const row = { name, start_date: start_date || null, supplier_company_id, agency_id: req.agency.agency_id, created_by: req.user.id };
+    if (slug) row.slug = slug;
+    const { data: proj, error } = await admin.from("agency_projects").insert(row).select().single();
+    if (error) throw error;
+    const mem = [...new Set([req.user.id, ...((members || []).filter(Boolean))])];
+    if (mem.length) {
+      const { error: mErr } = await admin.from("agency_project_members").insert(mem.map(m => ({ agency_project_id: proj.id, member_id: m })));
+      if (mErr) throw mErr;
+    }
+    res.json(proj);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ============================================================
+// AGENCY — manage its OWN clients and supplier users
+// ============================================================
+app.patch("/clients/:id", authed, requireRole("agency"), async (req, res) => {
+  const { name, email, password } = req.body;
+  try {
+    const { data: c } = await admin.from("clients").select("owner_agency_id, profile_id").eq("id", req.params.id).single();
+    if (!c) return res.status(404).json({ error: "Client not found" });
+    if (c.owner_agency_id !== req.agency.agency_id) return res.status(403).json({ error: "Not your client" });
+    if (name != null) { await admin.from("clients").update({ name }).eq("id", req.params.id); await admin.from("profiles").update({ display_name: name }).eq("id", c.profile_id); }
+    if (email != null) await admin.from("clients").update({ email }).eq("id", req.params.id);
+    if (email != null || password) await admin.auth.admin.updateUserById(c.profile_id, { ...(email != null ? { email } : {}), ...(password ? { password } : {}) });
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.delete("/clients/:id", authed, requireRole("agency"), async (req, res) => {
+  try {
+    const { data: c } = await admin.from("clients").select("owner_agency_id, profile_id").eq("id", req.params.id).single();
+    if (!c) return res.status(404).json({ error: "Client not found" });
+    if (c.owner_agency_id !== req.agency.agency_id) return res.status(403).json({ error: "Not your client" });
+    const { count } = await admin.from("projects").select("*", { count: "exact", head: true }).eq("client_id", req.params.id);
+    if (count > 0) return res.status(409).json({ error: `This client has ${count} project(s). Delete or reassign those first.` });
+    await admin.from("clients").delete().eq("id", req.params.id);
+    await admin.auth.admin.deleteUser(c.profile_id);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.patch("/supplier-users/:profile_id", authed, requireRole("agency"), async (req, res) => {
+  const { name, email, password, supplier_company_id } = req.body;
+  const pid = req.params.profile_id;
+  try {
+    const { data: su } = await admin.from("supplier_users").select("supplier_company_id").eq("profile_id", pid).single();
+    if (!su) return res.status(404).json({ error: "Supplier user not found" });
+    const { data: sc } = await admin.from("supplier_companies").select("owner_agency_id").eq("id", su.supplier_company_id).single();
+    if (!sc || sc.owner_agency_id !== req.agency.agency_id) return res.status(403).json({ error: "Not your supplier" });
+    if (supplier_company_id != null && supplier_company_id !== su.supplier_company_id) {
+      const { data: dest } = await admin.from("supplier_companies").select("owner_agency_id").eq("id", supplier_company_id).single();
+      if (!dest || dest.owner_agency_id !== req.agency.agency_id) return res.status(403).json({ error: "That company isn't yours" });
+    }
+    if (name != null) await admin.from("profiles").update({ display_name: name }).eq("id", pid);
+    const suPatch = {};
+    if (supplier_company_id != null) suPatch.supplier_company_id = supplier_company_id;
+    if (email != null) suPatch.email = email;
+    if (Object.keys(suPatch).length) await admin.from("supplier_users").update(suPatch).eq("profile_id", pid);
+    if (email != null || password) await admin.auth.admin.updateUserById(pid, { ...(email != null ? { email } : {}), ...(password ? { password } : {}) });
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.delete("/supplier-users/:profile_id", authed, requireRole("agency"), async (req, res) => {
+  const pid = req.params.profile_id;
+  try {
+    const { data: su } = await admin.from("supplier_users").select("supplier_company_id").eq("profile_id", pid).single();
+    if (!su) return res.status(404).json({ error: "Supplier user not found" });
+    const { data: sc } = await admin.from("supplier_companies").select("owner_agency_id").eq("id", su.supplier_company_id).single();
+    if (!sc || sc.owner_agency_id !== req.agency.agency_id) return res.status(403).json({ error: "Not your supplier" });
+    const { count } = await admin.from("files").select("*", { count: "exact", head: true }).eq("uploaded_by", pid);
+    if (count > 0) return res.status(409).json({ error: `This supplier uploaded ${count} file(s). Remove those first.` });
+    await admin.from("supplier_users").delete().eq("profile_id", pid);
+    await admin.auth.admin.deleteUser(pid);
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
