@@ -177,14 +177,21 @@ app.post("/supplier-users", authed, requireRole("agency"), async (req, res) => {
     res.json({ id, series, name });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
-app.post("/projects/:id/files", authed, requireRole("agency"), upload.single("file"), async (req, res) => {
+app.post("/projects/:id/files", authed, upload.single("file"), async (req, res) => {
   const projectId = req.params.id;
   const { description, type } = req.body;
   try {
-    // membership check (defense in depth; RLS also guards the insert)
-    const { data: member } = await admin.from("project_members")
-      .select("project_id").eq("project_id", projectId).eq("member_id", req.user.id).maybeSingle();
-    if (!member) return res.status(403).json({ error: "Not a member of this project" });
+    // permission: an agency member of the project, OR the project's client
+    const { data: proj0 } = await admin.from("projects").select("client_id").eq("id", projectId).single();
+    let allowed = false;
+    if (req.user.role === "agency") {
+      const { data: member } = await admin.from("project_members").select("project_id").eq("project_id", projectId).eq("member_id", req.user.id).maybeSingle();
+      allowed = !!member;
+    } else if (req.user.role === "client" && proj0) {
+      const { data: cl } = await admin.from("clients").select("profile_id").eq("id", proj0.client_id).single();
+      allowed = !!cl && cl.profile_id === req.user.id;
+    }
+    if (!allowed) return res.status(403).json({ error: "Not allowed to upload to this project" });
     if (!req.file) return res.status(400).json({ error: "No file" });
 
     const { data: project } = await admin.from("projects")
@@ -223,7 +230,7 @@ app.post("/projects/:id/files", authed, requireRole("agency"), upload.single("fi
       project_id: projectId, description, type: type || "Others",
       file_name: req.file.originalname,
       drive_file_id: uploaded.data.id, drive_link: uploaded.data.webViewLink,
-      uploaded_by: req.user.id,
+      uploaded_by: req.user.id, uploader_role: req.user.role,
     }).select().single();
     if (error) throw error;
     res.json(row);
@@ -234,7 +241,7 @@ app.post("/projects/:id/files", authed, requireRole("agency"), upload.single("fi
 // AGENCY-PROJECT FILE UPLOAD  (the SUPPLIER uploads; the agency acknowledges)
 // Drive tree: _DISPATCHR / [AGENCY] / _SUPPLIERS / [SUPPLIER COMPANY] / [yyyymmdd Project]
 // ============================================================
-app.post("/agency-projects/:id/files", authed, requireRole("supplier"), upload.single("file"), async (req, res) => {
+app.post("/agency-projects/:id/files", authed, upload.single("file"), async (req, res) => {
   const apId = req.params.id;
   const { description, type } = req.body;
   try {
@@ -243,10 +250,15 @@ app.post("/agency-projects/:id/files", authed, requireRole("supplier"), upload.s
       .select("id, name, start_date, drive_folder_id, supplier_company_id, agencies(name), supplier_companies(name)")
       .eq("id", apId).single();
     if (!ap) return res.status(404).json({ error: "Project not found" });
-    // the uploader must belong to this project's supplier company
-    if (ap.supplier_company_id !== req.supplier?.supplier_company_id) {
-      return res.status(403).json({ error: "Not your supplier company's project" });
+    // permission: the project's supplier company, OR an agency member of the project
+    let allowed = false;
+    if (req.user.role === "supplier") {
+      allowed = ap.supplier_company_id === req.supplier?.supplier_company_id;
+    } else if (req.user.role === "agency") {
+      const { data: member } = await admin.from("agency_project_members").select("agency_project_id").eq("agency_project_id", apId).eq("member_id", req.user.id).maybeSingle();
+      allowed = !!member;
     }
+    if (!allowed) return res.status(403).json({ error: "Not allowed to upload to this project" });
 
     const drive = driveClient();
     // One permanent folder per agency project, stored on first upload (renames never fork it).
@@ -277,7 +289,7 @@ app.post("/agency-projects/:id/files", authed, requireRole("supplier"), upload.s
       agency_project_id: apId, description, type: type || "Others",
       file_name: req.file.originalname,
       drive_file_id: uploaded.data.id, drive_link: uploaded.data.webViewLink,
-      uploaded_by: req.user.id,
+      uploaded_by: req.user.id, uploader_role: req.user.role,
     }).select().single();
     if (error) throw error;
     res.json(row);
@@ -638,6 +650,61 @@ app.post("/names", authed, async (req, res) => {
     const { data } = await admin.from("profiles").select("id, display_name").in("id", ids);
     const map = {}; (data || []).forEach(p => { map[p.id] = p.display_name; });
     res.json(map);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ============================================================
+// ACKNOWLEDGE  — only the party who did NOT upload the file may acknowledge it
+// ============================================================
+async function isAcknowledger(req, file){
+  if(file.project_id){
+    const side = file.uploader_role === "client" ? "agency" : "client";
+    if(side === "client"){
+      const { data: pr } = await admin.from("projects").select("client_id").eq("id", file.project_id).single();
+      if(!pr) return false;
+      const { data: cl } = await admin.from("clients").select("profile_id").eq("id", pr.client_id).single();
+      return req.user.role === "client" && !!cl && cl.profile_id === req.user.id;
+    } else {
+      if(req.user.role !== "agency") return false;
+      const { data: m } = await admin.from("project_members").select("project_id").eq("project_id", file.project_id).eq("member_id", req.user.id).maybeSingle();
+      if(m) return true;
+      const { data: pr } = await admin.from("projects").select("created_by, agency_id").eq("id", file.project_id).single();
+      return !!pr && (pr.created_by === req.user.id || (req.agency && pr.agency_id === req.agency.agency_id));
+    }
+  } else if(file.agency_project_id){
+    const { data: ap } = await admin.from("agency_projects").select("supplier_company_id, agency_id, created_by").eq("id", file.agency_project_id).single();
+    if(!ap) return false;
+    const side = file.uploader_role === "agency" ? "supplier" : "agency";
+    if(side === "supplier"){
+      return req.user.role === "supplier" && req.supplier && req.supplier.supplier_company_id === ap.supplier_company_id;
+    } else {
+      if(req.user.role !== "agency") return false;
+      const { data: m } = await admin.from("agency_project_members").select("agency_project_id").eq("agency_project_id", file.agency_project_id).eq("member_id", req.user.id).maybeSingle();
+      return !!m || ap.created_by === req.user.id || (req.agency && ap.agency_id === req.agency.agency_id);
+    }
+  }
+  return false;
+}
+
+app.post("/files/:id/acknowledge", authed, async (req, res) => {
+  try {
+    const { data: file } = await admin.from("files").select("id, ack_at, uploader_role, project_id, agency_project_id").eq("id", req.params.id).single();
+    if (!file) return res.status(404).json({ error: "Not found" });
+    if (!(await isAcknowledger(req, file))) return res.status(403).json({ error: "You're not the party who acknowledges this file" });
+    await admin.from("files").update({ ack_at: new Date().toISOString() }).eq("id", file.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.post("/files/:id/unacknowledge", authed, async (req, res) => {
+  try {
+    const { data: file } = await admin.from("files").select("id, ack_at, uploader_role, project_id, agency_project_id").eq("id", req.params.id).single();
+    if (!file) return res.status(404).json({ error: "Not found" });
+    if (!(await isAcknowledger(req, file))) return res.status(403).json({ error: "Not allowed" });
+    if (file.ack_at && (Date.now() - new Date(file.ack_at).getTime() > 5 * 60 * 1000))
+      return res.status(409).json({ error: "Reset is only allowed within 5 minutes of acknowledging" });
+    await admin.from("files").update({ ack_at: null }).eq("id", file.id);
+    res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
