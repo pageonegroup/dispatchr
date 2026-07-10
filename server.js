@@ -454,7 +454,7 @@ app.patch("/admin/supplier-users/:profile_id", authed, requireRole("super_admin"
       await admin.from("profiles").update({ display_name: name }).eq("id", req.params.profile_id);
     }
     const suPatch = {};
-    if (supplier_company_id != null) suPatch.supplier_company_id = supplier_company_id;
+    if ("supplier_company_id" in req.body) suPatch.supplier_company_id = supplier_company_id || null;
     if (series != null) suPatch.series = series;
     if (Object.keys(suPatch).length) await admin.from("supplier_users").update(suPatch).eq("profile_id", req.params.profile_id);
     if (email != null || password)
@@ -607,7 +607,7 @@ app.patch("/supplier-users/:profile_id", authed, requireRole("agency"), async (r
     }
     if (name != null) await admin.from("profiles").update({ display_name: name }).eq("id", pid);
     const suPatch = {};
-    if (supplier_company_id != null) suPatch.supplier_company_id = supplier_company_id;
+    if ("supplier_company_id" in req.body) suPatch.supplier_company_id = supplier_company_id || null;
     if (email != null) suPatch.email = email;
     if (Object.keys(suPatch).length) await admin.from("supplier_users").update(suPatch).eq("profile_id", pid);
     if (email != null || password) await admin.auth.admin.updateUserById(pid, { ...(email != null ? { email } : {}), ...(password ? { password } : {}) });
