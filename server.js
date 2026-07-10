@@ -630,4 +630,15 @@ app.delete("/supplier-users/:profile_id", authed, requireRole("agency"), async (
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// Resolve profile IDs -> display names (any authed user; service role bypasses RLS)
+app.post("/names", authed, async (req, res) => {
+  const ids = (req.body.ids || []).filter(Boolean).slice(0, 1000);
+  if (!ids.length) return res.json({});
+  try {
+    const { data } = await admin.from("profiles").select("id, display_name").in("id", ids);
+    const map = {}; (data || []).forEach(p => { map[p.id] = p.display_name; });
+    res.json(map);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => console.log(`Dispatchr backend on :${PORT}`));
