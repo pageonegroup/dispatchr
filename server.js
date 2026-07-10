@@ -86,18 +86,6 @@ async function ensureFolder(drive, name, parentId) {
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Safe self-check (exposes no secrets): confirms the service key is set correctly.
-// Visit https://<your-backend>/debug/service-key in a browser.
-app.get("/debug/service-key", async (_req, res) => {
-  const looksPublishable = String(SERVICE_KEY || "").startsWith("sb_publishable");
-  let canReadProfiles = false, profileCount = null, error = null;
-  try {
-    const r = await admin.from("profiles").select("*", { count: "exact", head: true });
-    if (r.error) error = r.error.message; else { canReadProfiles = true; profileCount = r.count; }
-  } catch (e) { error = e.message; }
-  res.json({ usingVar: SUPABASE_SECRET ? "SUPABASE_SECRET" : "SUPABASE_SERVICE_ROLE_KEY", looksPublishable, canReadProfiles, profileCount, error });
-});
-
 // ============================================================
 // GOOGLE DRIVE — one-time OAuth connect (run as super admin once)
 // ============================================================
@@ -135,7 +123,7 @@ app.get("/drive/status", authed, requireRole("super_admin"), async (_req, res) =
 // Super admin creates an agency user
 app.post("/agency-users", authed, requireRole("super_admin"), async (req, res) => {
   const { series, name, agency_id, email, password } = req.body;
-  if (!/^A\d{6}$/.test(series || "")) return res.status(400).json({ error: "Series must be A + 6 digits" });
+  if (!/^A[A-Za-z0-9]{1,12}$/.test(series || "")) return res.status(400).json({ error: "Series must be A + up to 12 letters or numbers" });
   try {
     const { data: created, error } = await admin.auth.admin.createUser({ email, password, email_confirm: true });
     if (error) throw error;
@@ -168,12 +156,12 @@ app.post("/clients", authed, requireRole("agency"), async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// Agency creates a supplier user (S + 6 digits) under one of its supplier companies.
+// Agency creates a supplier user (S + up to 12 letters/numbers) under one of its supplier companies.
 // The supplier company itself is created by the browser directly (RLS allows the agency);
 // only the login needs the service role, so it lives here.
 app.post("/supplier-users", authed, requireRole("agency"), async (req, res) => {
   const { series, name, supplier_company_id, email, password } = req.body;
-  if (!/^S\d{6}$/.test(series || "")) return res.status(400).json({ error: "Series must be S + 6 digits" });
+  if (!/^S[A-Za-z0-9]{1,12}$/.test(series || "")) return res.status(400).json({ error: "Series must be S + up to 12 letters or numbers" });
   if (!name) return res.status(400).json({ error: "Name is required" });
   try {
     // the supplier company must belong to the calling agency
