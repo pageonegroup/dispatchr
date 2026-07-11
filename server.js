@@ -479,7 +479,7 @@ app.post("/supplier-users", authed, requireRole("agency"), async (req, res) => {
     if (error) throw error;
     const id = created.user.id;
     await admin.from("profiles").insert({ id, role: "supplier", display_name: name });
-    await admin.from("supplier_users").insert({ profile_id: id, series, supplier_company_id, email });
+    await admin.from("supplier_users").insert({ profile_id: id, series, supplier_company_id, email, created_by: req.user.id });
     res.json({ id, series, name });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -845,7 +845,7 @@ app.post("/admin/supplier-users", authed, requireRole("super_admin"), async (req
     if (error) throw error;
     const id = created.user.id;
     await admin.from("profiles").insert({ id, role: "supplier", display_name: name });
-    await admin.from("supplier_users").insert({ profile_id: id, series, supplier_company_id, email });
+    await admin.from("supplier_users").insert({ profile_id: id, series, supplier_company_id, email, created_by: req.user.id });
     res.json({ id, series, name });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -876,6 +876,66 @@ app.delete("/admin/supplier-users/:profile_id", authed, requireRole("super_admin
     if (count > 0) return res.status(409).json({ error: `This supplier has uploaded ${count} file(s). Remove those first.` });
     await admin.from("supplier_users").delete().eq("profile_id", req.params.profile_id);
     await admin.auth.admin.deleteUser(req.params.profile_id); // removes login; profile cascades
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ---- HIDE / INACTIVE for client & supplier users ------------------------------
+// A person is BANNED from logging in whenever hidden OR inactive (RLS can't block
+// login, so we ban the auth user). Provenance (hidden_by / role / at) decides who
+// may unhide: admin always; otherwise only the agency user who hid it, and only if
+// it was an agency hide (admin hides are admin-only to reverse).
+const PEOPLE_TABLE = { client: "clients", supplier: "supplier_users" };
+
+async function applyBan(profileId, banned) {
+  if (!profileId) return;
+  try { await admin.auth.admin.updateUserById(profileId, { ban_duration: banned ? "876600h" : "none" }); }
+  catch (e) { console.error("[Dispatchr] ban toggle failed:", e.message); }
+}
+async function getPersonRow(kind, id) {
+  const table = PEOPLE_TABLE[kind];
+  if (!table) return null;
+  const key = kind === "supplier" ? "profile_id" : "id";
+  const { data } = await admin.from(table).select("*").eq(key, id).maybeSingle();
+  return data ? { table, key, row: data } : null;
+}
+const canManagePerson = (req, row) => req.user.role === "super_admin" || row.created_by === req.user.id;
+const canUnhidePerson = (req, row) => req.user.role === "super_admin" || (row.hidden_by === req.user.id && row.hidden_by_role === "agency");
+
+app.post("/people/:kind/:id/hide", authed, requireRole("super_admin", "agency"), async (req, res) => {
+  try {
+    const found = await getPersonRow(req.params.kind, req.params.id);
+    if (!found) return res.status(404).json({ error: "Not found" });
+    if (!canManagePerson(req, found.row)) return res.status(403).json({ error: "Only the creator or an admin can hide this." });
+    const patch = { hidden_by: req.user.id, hidden_by_role: req.user.role === "super_admin" ? "super_admin" : "agency", hidden_at: new Date().toISOString() };
+    const { error } = await admin.from(found.table).update(patch).eq(found.key, req.params.id);
+    if (error) throw error;
+    await applyBan(found.row.profile_id, true); // hidden => login blocked
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.post("/people/:kind/:id/unhide", authed, requireRole("super_admin", "agency"), async (req, res) => {
+  try {
+    const found = await getPersonRow(req.params.kind, req.params.id);
+    if (!found) return res.status(404).json({ error: "Not found" });
+    if (!canUnhidePerson(req, found.row)) return res.status(403).json({ error: "Only whoever hid this (or an admin) can unhide it." });
+    const { error } = await admin.from(found.table).update({ hidden_by: null, hidden_by_role: null, hidden_at: null }).eq(found.key, req.params.id);
+    if (error) throw error;
+    await applyBan(found.row.profile_id, (found.row.status || "active") === "inactive"); // stay banned if still inactive
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.post("/people/:kind/:id/status", authed, requireRole("super_admin", "agency"), async (req, res) => {
+  try {
+    const status = req.body.status === "inactive" ? "inactive" : "active";
+    const found = await getPersonRow(req.params.kind, req.params.id);
+    if (!found) return res.status(404).json({ error: "Not found" });
+    if (!canManagePerson(req, found.row)) return res.status(403).json({ error: "Only the creator or an admin can change status." });
+    const { error } = await admin.from(found.table).update({ status, status_by: req.user.id, status_at: new Date().toISOString() }).eq(found.key, req.params.id);
+    if (error) throw error;
+    await applyBan(found.row.profile_id, status === "inactive" || !!found.row.hidden_at); // banned if inactive OR still hidden
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
