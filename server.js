@@ -54,6 +54,7 @@ async function loadRefreshToken() {
 }
 async function saveRefreshToken(tok) {
   currentRefreshToken = tok;
+  driveStatusCache = { at: 0, connected: false }; // force a fresh check after reconnect
   const { error } = await admin.from("app_secrets")
     .upsert({ key: "google_refresh_token", value: tok, updated_at: new Date().toISOString() }, { onConflict: "key" });
   if (error) throw error;
@@ -63,6 +64,18 @@ function driveClient() {
   const o = oauth();
   o.setCredentials({ refresh_token: currentRefreshToken });
   return google.drive({ version: "v3", auth: o });
+}
+
+// Cheap "is Drive working" check shared by all users, cached 60s so many page loads don't
+// each hit Google. Any authed user can read this (boolean only — no account details).
+let driveStatusCache = { at: 0, connected: false };
+async function driveConnected() {
+  const now = Date.now();
+  if (now - driveStatusCache.at < 60000) return driveStatusCache.connected;
+  let connected = false;
+  try { await driveClient().about.get({ fields: "user(emailAddress)" }); connected = true; } catch (_) {}
+  driveStatusCache = { at: now, connected };
+  return connected;
 }
 
 // Identify the caller from their Supabase JWT and load their profile (role, agency)
@@ -210,6 +223,11 @@ app.get("/drive/status", authed, requireRole("super_admin"), async (_req, res) =
     const about = await driveClient().about.get({ fields: "user(emailAddress)" });
     res.json({ connected: true, account: about.data.user.emailAddress });
   } catch { res.json({ connected: false }); }
+});
+
+// Global connection indicator for the top-bar — readable by ANY signed-in user (boolean only).
+app.get("/drive/connected", authed, async (_req, res) => {
+  res.json({ connected: await driveConnected() });
 });
 
 // Storage quota on the connected service account — represents the whole system,
