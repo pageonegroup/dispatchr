@@ -84,6 +84,51 @@ async function ensureFolder(drive, name, parentId) {
   return created.data.id;
 }
 
+// Resolve the permanent Drive folder for the project (or agency project) that a files row
+// belongs to, creating the folder tree on first need — mirrors the upload endpoints exactly.
+async function resolveFolderForFileRow(drive, file) {
+  if (file.project_id) {
+    const { data: project } = await admin.from("projects")
+      .select("id, name, start_date, drive_folder_id, agencies(name)").eq("id", file.project_id).single();
+    if (project.drive_folder_id) return project.drive_folder_id;
+    const agencyName = (project.agencies?.name || "UNKNOWN").toUpperCase();
+    const root = await ensureFolder(drive, "_DISPATCHR", "root");
+    const agencyFolder = await ensureFolder(drive, agencyName, root);
+    const ymd = String(project.start_date || "").replace(/-/g, "").slice(0, 8) || "00000000";
+    const created = await drive.files.create({
+      requestBody: { name: `${ymd} ${project.name}`, mimeType: "application/vnd.google-apps.folder", parents: [agencyFolder] },
+      fields: "id",
+    });
+    await admin.from("projects").update({ drive_folder_id: created.data.id }).eq("id", file.project_id);
+    return created.data.id;
+  }
+  if (file.agency_project_id) {
+    const { data: ap } = await admin.from("agency_projects")
+      .select("id, name, start_date, drive_folder_id, agencies(name), supplier_companies(name)").eq("id", file.agency_project_id).single();
+    if (ap.drive_folder_id) return ap.drive_folder_id;
+    const agencyName = (ap.agencies?.name || "UNKNOWN").toUpperCase();
+    const supplierName = ap.supplier_companies?.name || "SUPPLIER";
+    const root = await ensureFolder(drive, "_DISPATCHR", "root");
+    const agencyFolder = await ensureFolder(drive, agencyName, root);
+    const supRoot = await ensureFolder(drive, "_SUPPLIERS", agencyFolder);
+    const supFolder = await ensureFolder(drive, supplierName, supRoot);
+    const ymd = String(ap.start_date || "").replace(/-/g, "").slice(0, 8) || "00000000";
+    const created = await drive.files.create({
+      requestBody: { name: `${ymd} ${ap.name}`, mimeType: "application/vnd.google-apps.folder", parents: [supFolder] },
+      fields: "id",
+    });
+    await admin.from("agency_projects").update({ drive_folder_id: created.data.id }).eq("id", file.agency_project_id);
+    return created.data.id;
+  }
+  throw new Error("File row is not attached to a project");
+}
+
+// May the current user manage (add/remove files on) this delivery row? Same gate as the
+// UI edit/delete buttons: an admin, or the person who uploaded it.
+function canManageFileRow(req, file) {
+  return req.user.role === "admin" || file.uploaded_by === req.user.id;
+}
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // ============================================================
@@ -341,6 +386,74 @@ app.get("/files/:id/download", authed, async (req, res) => {
     const stream = await drive.files.get({ fileId: att.id, alt: "media" }, { responseType: "stream" });
     res.setHeader("Content-Disposition", `attachment; filename="${att.name || file.file_name}"`);
     stream.data.pipe(res);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ============================================================
+// FILE ATTACHMENTS  (add/remove individual files within one delivery row)
+// ============================================================
+
+// Remove ONE file from a delivery. Deletes it from Drive too. If it was the last
+// file in the delivery, the whole row is removed.
+app.delete("/files/:id/attachments/:idx", authed, async (req, res) => {
+  try {
+    const { data: file } = await admin.from("files")
+      .select("id, uploaded_by, attachments, drive_file_id, drive_link, file_name").eq("id", req.params.id).single();
+    if (!file) return res.status(404).json({ error: "Not found" });
+    if (!canManageFileRow(req, file)) return res.status(403).json({ error: "Not allowed" });
+
+    const atts = (Array.isArray(file.attachments) && file.attachments.length)
+      ? file.attachments.slice()
+      : [{ id: file.drive_file_id, link: file.drive_link, name: file.file_name }];
+    const idx = parseInt(req.params.idx, 10);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= atts.length) return res.status(400).json({ error: "Bad index" });
+
+    const removed = atts[idx];
+    if (removed && removed.id) { try { await driveClient().files.delete({ fileId: removed.id }); } catch (_) {} }
+    atts.splice(idx, 1);
+
+    if (!atts.length) {
+      await admin.from("files").delete().eq("id", file.id);
+      return res.json({ deleted: true, rowDeleted: true });
+    }
+    const first = atts[0];
+    const { data: row, error } = await admin.from("files")
+      .update({ attachments: atts, drive_file_id: first.id, drive_link: first.link, file_name: first.name })
+      .eq("id", file.id).select().single();
+    if (error) throw error;
+    res.json({ deleted: true, rowDeleted: false, file: row });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Add one or more files to an existing delivery (drops them in the same Drive folder).
+app.post("/files/:id/attachments", authed, upload.array("files", 50), async (req, res) => {
+  try {
+    if (!req.files || !req.files.length) return res.status(400).json({ error: "No file" });
+    const { data: file } = await admin.from("files")
+      .select("id, uploaded_by, project_id, agency_project_id, attachments, drive_file_id, drive_link, file_name").eq("id", req.params.id).single();
+    if (!file) return res.status(404).json({ error: "Not found" });
+    if (!canManageFileRow(req, file)) return res.status(403).json({ error: "Not allowed" });
+
+    const drive = driveClient();
+    const parent = await resolveFolderForFileRow(drive, file);
+
+    const atts = (Array.isArray(file.attachments) && file.attachments.length)
+      ? file.attachments.slice()
+      : (file.drive_file_id ? [{ id: file.drive_file_id, link: file.drive_link, name: file.file_name }] : []);
+    for (const f of req.files) {
+      const up = await drive.files.create({
+        requestBody: { name: f.originalname, parents: [parent] },
+        media: { mimeType: f.mimetype, body: Readable.from(f.buffer) },
+        fields: "id, webViewLink",
+      });
+      atts.push({ id: up.data.id, link: up.data.webViewLink, name: f.originalname });
+    }
+    const first = atts[0];
+    const { data: row, error } = await admin.from("files")
+      .update({ attachments: atts, drive_file_id: first.id, drive_link: first.link, file_name: first.name })
+      .eq("id", file.id).select().single();
+    if (error) throw error;
+    res.json(row);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
