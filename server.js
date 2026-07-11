@@ -78,6 +78,36 @@ async function driveConnected() {
   return connected;
 }
 
+// ---------- root folder (the top Dispatchr folder in Drive) ----------
+// Configurable from the admin UI, cached in memory. Falls back to the legacy "_DISPATCHR"
+// folder under My Drive when nothing has been set, so existing installs keep working.
+let rootFolder = { id: null, name: null };
+async function loadRootFolder() {
+  try {
+    const { data } = await admin.from("app_secrets").select("key, value").in("key", ["drive_root_folder_id", "drive_root_folder_name"]);
+    const m = {}; (data || []).forEach(r => { m[r.key] = r.value; });
+    rootFolder = { id: m.drive_root_folder_id || null, name: m.drive_root_folder_name || null };
+  } catch (e) { console.error("[Dispatchr] could not load root folder:", e.message); }
+}
+async function saveRootFolder(id, name) {
+  rootFolder = { id, name };
+  const now = new Date().toISOString();
+  const { error } = await admin.from("app_secrets").upsert([
+    { key: "drive_root_folder_id", value: id, updated_at: now },
+    { key: "drive_root_folder_name", value: name, updated_at: now },
+  ], { onConflict: "key" });
+  if (error) throw error;
+}
+// The parent every agency folder is created under: the configured root when set,
+// otherwise the legacy "_DISPATCHR" folder under My Drive — which we then adopt as the
+// stored root so it appears in the UI (ensureFolder finds the existing one, no duplicate).
+async function resolveRootFolderId(drive) {
+  if (rootFolder.id) return rootFolder.id;
+  const id = await ensureFolder(drive, "_DISPATCHR", "root");
+  try { await saveRootFolder(id, "_DISPATCHR"); } catch (_) {}
+  return id;
+}
+
 // Identify the caller from their Supabase JWT and load their profile (role, agency)
 async function authed(req, res, next) {
   try {
@@ -122,7 +152,7 @@ async function resolveFolderForFileRow(drive, file) {
       .select("id, name, start_date, drive_folder_id, agencies(name)").eq("id", file.project_id).single();
     if (project.drive_folder_id) return project.drive_folder_id;
     const agencyName = (project.agencies?.name || "UNKNOWN").toUpperCase();
-    const root = await ensureFolder(drive, "_DISPATCHR", "root");
+    const root = await resolveRootFolderId(drive);
     const agencyFolder = await ensureFolder(drive, agencyName, root);
     const ymd = String(project.start_date || "").replace(/-/g, "").slice(0, 8) || "00000000";
     const created = await drive.files.create({
@@ -138,7 +168,7 @@ async function resolveFolderForFileRow(drive, file) {
     if (ap.drive_folder_id) return ap.drive_folder_id;
     const agencyName = (ap.agencies?.name || "UNKNOWN").toUpperCase();
     const supplierName = ap.supplier_companies?.name || "SUPPLIER";
-    const root = await ensureFolder(drive, "_DISPATCHR", "root");
+    const root = await resolveRootFolderId(drive);
     const agencyFolder = await ensureFolder(drive, agencyName, root);
     const supRoot = await ensureFolder(drive, "_SUPPLIERS", agencyFolder);
     const supFolder = await ensureFolder(drive, supplierName, supRoot);
@@ -228,6 +258,71 @@ app.get("/drive/status", authed, requireRole("super_admin"), async (_req, res) =
 // Global connection indicator for the top-bar — readable by ANY signed-in user (boolean only).
 app.get("/drive/connected", authed, async (_req, res) => {
   res.json({ connected: await driveConnected() });
+});
+
+// ---- ROOT FOLDER management (super admin) --------------------------------
+// Current root (id + name). If none is set yet, adopt an EXISTING "_DISPATCHR" folder if one
+// is already in Drive — search only, nothing is created here (fresh installs stay blank).
+app.get("/drive/root", authed, requireRole("super_admin"), async (_req, res) => {
+  if (rootFolder.id) return res.json({ id: rootFolder.id, name: rootFolder.name });
+  try {
+    const found = await driveClient().files.list({
+      q: "name = '_DISPATCHR' and 'root' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+      fields: "files(id, name)", spaces: "drive",
+    });
+    if (found.data.files && found.data.files.length) {
+      const f = found.data.files[0];
+      await saveRootFolder(f.id, f.name);
+      return res.json({ id: f.id, name: f.name });
+    }
+  } catch (_) {}
+  res.json({ id: null, name: null });
+});
+
+// Create a brand-new folder in Drive and make it the root.
+app.post("/drive/root/create", authed, requireRole("super_admin"), async (req, res) => {
+  const name = (req.body.name || "").trim();
+  if (!name) return res.status(400).json({ error: "Folder name is required" });
+  try {
+    const created = await driveClient().files.create({
+      requestBody: { name, mimeType: "application/vnd.google-apps.folder", parents: ["root"] },
+      fields: "id, name",
+    });
+    await saveRootFolder(created.data.id, created.data.name || name);
+    res.json({ id: created.data.id, name: created.data.name || name });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// List folders Dispatchr can see (drive.file scope = folders this app created), for the
+// "Connect Root" picker. Browsing the user's whole Drive would need a broader scope.
+app.get("/drive/folders", authed, requireRole("super_admin"), async (_req, res) => {
+  try {
+    const drive = driveClient();
+    const out = []; let pageToken;
+    do {
+      const r = await drive.files.list({
+        q: "mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+        fields: "nextPageToken, files(id, name)",
+        pageSize: 100, spaces: "drive", orderBy: "name", pageToken,
+      });
+      (r.data.files || []).forEach(f => out.push({ id: f.id, name: f.name }));
+      pageToken = r.data.nextPageToken;
+    } while (pageToken && out.length < 500);
+    res.json({ folders: out });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Point the root at an existing folder chosen from the picker.
+app.post("/drive/root/connect", authed, requireRole("super_admin"), async (req, res) => {
+  const id = (req.body.id || "").trim();
+  if (!id) return res.status(400).json({ error: "Folder id is required" });
+  try {
+    const meta = await driveClient().files.get({ fileId: id, fields: "id, name, mimeType, trashed" });
+    if (meta.data.trashed) return res.status(400).json({ error: "That folder is in the trash" });
+    if (meta.data.mimeType !== "application/vnd.google-apps.folder") return res.status(400).json({ error: "That item is not a folder" });
+    await saveRootFolder(meta.data.id, meta.data.name);
+    res.json({ id: meta.data.id, name: meta.data.name });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // Storage quota on the connected service account — represents the whole system,
@@ -380,7 +475,7 @@ app.post("/projects/:id/files", authed, upload.array("files", 50), async (req, r
     let parent = project.drive_folder_id;
     if (!parent) {
       const agencyName = (project.agencies?.name || "UNKNOWN").toUpperCase();
-      const root = await ensureFolder(drive, "_DISPATCHR", "root");
+      const root = await resolveRootFolderId(drive);
       const agencyFolder = await ensureFolder(drive, agencyName, root);
       const ymd = String(project.start_date || "").replace(/-/g, "").slice(0, 8) || "00000000";
       const created = await drive.files.create({
@@ -446,7 +541,7 @@ app.post("/agency-projects/:id/files", authed, upload.array("files", 50), async 
     if (!parent) {
       const agencyName = (ap.agencies?.name || "UNKNOWN").toUpperCase();
       const supplierName = ap.supplier_companies?.name || "SUPPLIER";
-      const root = await ensureFolder(drive, "_DISPATCHR", "root");
+      const root = await resolveRootFolderId(drive);
       const agencyFolder = await ensureFolder(drive, agencyName, root);
       const supRoot = await ensureFolder(drive, "_SUPPLIERS", agencyFolder);
       const supFolder = await ensureFolder(drive, supplierName, supRoot);
@@ -970,4 +1065,5 @@ app.post("/files/:id/unacknowledge", authed, async (req, res) => {
 });
 
 await loadRefreshToken(); // seed the current Google token from the DB before serving
+await loadRootFolder();   // seed the configured root folder from the DB
 app.listen(PORT, () => console.log(`Dispatchr backend on :${PORT}`));
