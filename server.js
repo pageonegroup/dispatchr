@@ -885,7 +885,7 @@ app.delete("/admin/supplier-users/:profile_id", authed, requireRole("super_admin
 // login, so we ban the auth user). Provenance (hidden_by / role / at) decides who
 // may unhide: admin always; otherwise only the agency user who hid it, and only if
 // it was an agency hide (admin hides are admin-only to reverse).
-const PEOPLE_TABLE = { client: "clients", supplier: "supplier_users" };
+const PEOPLE_TABLE = { client: "clients", supplier: "supplier_users", company: "supplier_companies", agency: "agency_users" };
 
 async function applyBan(profileId, banned) {
   if (!profileId) return;
@@ -895,7 +895,7 @@ async function applyBan(profileId, banned) {
 async function getPersonRow(kind, id) {
   const table = PEOPLE_TABLE[kind];
   if (!table) return null;
-  const key = kind === "supplier" ? "profile_id" : "id";
+  const key = (kind === "supplier" || kind === "agency") ? "profile_id" : "id";
   const { data } = await admin.from(table).select("*").eq(key, id).maybeSingle();
   return data ? { table, key, row: data } : null;
 }
