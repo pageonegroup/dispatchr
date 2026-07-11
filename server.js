@@ -42,9 +42,26 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100
 // ---------- helpers ----------
 const oauth = () => new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
 
+// The Google refresh token lives in the DB (app_secrets) so re-connecting never needs a
+// redeploy. We cache it in memory for synchronous driveClient() calls, seed it from the
+// env var as a fallback, load it fresh at boot, and update it whenever a new one is saved.
+let currentRefreshToken = GOOGLE_REFRESH_TOKEN || null;
+async function loadRefreshToken() {
+  try {
+    const { data } = await admin.from("app_secrets").select("value").eq("key", "google_refresh_token").maybeSingle();
+    if (data && data.value) currentRefreshToken = data.value;
+  } catch (e) { console.error("[Dispatchr] could not load refresh token:", e.message); }
+}
+async function saveRefreshToken(tok) {
+  currentRefreshToken = tok;
+  const { error } = await admin.from("app_secrets")
+    .upsert({ key: "google_refresh_token", value: tok, updated_at: new Date().toISOString() }, { onConflict: "key" });
+  if (error) throw error;
+}
+
 function driveClient() {
   const o = oauth();
-  o.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+  o.setCredentials({ refresh_token: currentRefreshToken });
   return google.drive({ version: "v3", auth: o });
 }
 
@@ -132,27 +149,60 @@ function canManageFileRow(req, file) {
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // ============================================================
-// GOOGLE DRIVE — one-time OAuth connect (run as super admin once)
+// GOOGLE DRIVE — one-click connect. An admin clicks "Connect" in the app, which opens
+// /drive/connect?t=<their login token>. We verify they're a super admin, send them to
+// Google's account picker, and on return SAVE the refresh token to the DB automatically —
+// no copy-paste, no redeploy. Reconnecting with the SAME Google account restores access to
+// every existing folder (each project's folder id is stored in the DB and never changes).
 // ============================================================
-// 1. Visit /drive/connect in a browser, approve consent.
-// 2. The callback prints a refresh token. Put it in GOOGLE_REFRESH_TOKEN on Railway.
-app.get("/drive/connect", (_req, res) => {
-  const url = oauth().generateAuthUrl({
-    access_type: "offline",
-    prompt: "consent", // forces a refresh_token to be returned
-    scope: ["https://www.googleapis.com/auth/drive.file"], // only files this app creates
-  });
-  res.redirect(url);
+let pendingConnectState = null;
+
+async function isSuperAdminToken(tok) {
+  if (!tok) return false;
+  const { data: { user }, error } = await anon.auth.getUser(tok);
+  if (error || !user) return false;
+  const { data: profile } = await admin.from("profiles").select("role").eq("id", user.id).single();
+  return !!profile && profile.role === "super_admin";
+}
+
+const drivePage = (title, body, ok) => `<!doctype html><meta charset="utf-8"><title>${title}</title>
+  <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0d12;color:#e8eaf0;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
+  <div style="max-width:420px;text-align:center;padding:32px">
+    <div style="font-size:44px;margin-bottom:10px">${ok ? "\u2705" : "\u26A0\uFE0F"}</div>
+    <h1 style="font-size:20px;margin:0 0 8px">${title}</h1>
+    <p style="color:#8b93a7;line-height:1.55;margin:0 0 22px">${body}</p>
+    <button onclick="window.close()" style="background:#c8a96e;color:#0b0d12;border:0;border-radius:8px;padding:10px 18px;font-weight:600;cursor:pointer">Close this window</button>
+  </div></body>`;
+
+app.get("/drive/connect", async (req, res) => {
+  try {
+    if (!(await isSuperAdminToken(req.query.t)))
+      return res.status(403).send(drivePage("Not authorised", "Open this from the Google Drive settings page while signed in as an admin.", false));
+    pendingConnectState = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const url = oauth().generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",              // always return a refresh token
+      include_granted_scopes: true,
+      state: pendingConnectState,
+      scope: ["https://www.googleapis.com/auth/drive.file"], // only files this app creates
+    });
+    res.redirect(url);
+  } catch (e) { res.status(500).send(drivePage("Couldn't start", e.message, false)); }
 });
 
 app.get("/drive/callback", async (req, res) => {
   try {
+    if (!req.query.state || req.query.state !== pendingConnectState)
+      return res.status(400).send(drivePage("Couldn't connect", "This connect link is invalid or expired. Please start again from the Google Drive settings page.", false));
+    pendingConnectState = null;
     const { tokens } = await oauth().getToken(req.query.code);
-    res.send(
-      `<pre>Connected. Copy this into Railway as GOOGLE_REFRESH_TOKEN, then redeploy:\n\n` +
-      `${tokens.refresh_token || "(no refresh token — remove app access in your Google account and retry)"}\n</pre>`
-    );
-  } catch (e) { res.status(500).send("OAuth error: " + e.message); }
+    if (!tokens.refresh_token)
+      return res.status(400).send(drivePage("Almost there", "Google didn't return a refresh token. Remove Dispatchr's access at myaccount.google.com/permissions, then click Connect again.", false));
+    await saveRefreshToken(tokens.refresh_token);
+    let email = "";
+    try { const about = await driveClient().about.get({ fields: "user(emailAddress)" }); email = about.data.user.emailAddress; } catch (_) {}
+    res.send(drivePage("Google Drive connected", `Dispatchr is now connected${email ? " as <b>" + email + "</b>" : ""}. You can close this window — uploads and downloads work right away.`, true));
+  } catch (e) { res.status(500).send(drivePage("Couldn't connect", "Something went wrong: " + e.message, false)); }
 });
 
 app.get("/drive/status", authed, requireRole("super_admin"), async (_req, res) => {
@@ -901,4 +951,5 @@ app.post("/files/:id/unacknowledge", authed, async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+await loadRefreshToken(); // seed the current Google token from the DB before serving
 app.listen(PORT, () => console.log(`Dispatchr backend on :${PORT}`));
