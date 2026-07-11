@@ -274,7 +274,7 @@ app.post("/projects/:id/files", authed, upload.array("files", 50), async (req, r
         media: { mimeType: file.mimetype, body: Readable.from(file.buffer) },
         fields: "id, webViewLink",
       });
-      attachments.push({ id: uploaded.data.id, link: uploaded.data.webViewLink, name: file.originalname });
+      attachments.push({ id: uploaded.data.id, link: uploaded.data.webViewLink, name: file.originalname, by: req.user.id, at: new Date().toISOString() });
     }
     const first = attachments[0];
 
@@ -338,7 +338,7 @@ app.post("/agency-projects/:id/files", authed, upload.array("files", 50), async 
         media: { mimeType: file.mimetype, body: Readable.from(file.buffer) },
         fields: "id, webViewLink",
       });
-      attachments.push({ id: uploaded.data.id, link: uploaded.data.webViewLink, name: file.originalname });
+      attachments.push({ id: uploaded.data.id, link: uploaded.data.webViewLink, name: file.originalname, by: req.user.id, at: new Date().toISOString() });
     }
     const first = attachments[0];
 
@@ -446,7 +446,7 @@ app.post("/files/:id/attachments", authed, upload.array("files", 50), async (req
         media: { mimeType: f.mimetype, body: Readable.from(f.buffer) },
         fields: "id, webViewLink",
       });
-      atts.push({ id: up.data.id, link: up.data.webViewLink, name: f.originalname });
+      atts.push({ id: up.data.id, link: up.data.webViewLink, name: f.originalname, by: req.user.id, at: new Date().toISOString() });
     }
     const first = atts[0];
     const { data: row, error } = await admin.from("files")
