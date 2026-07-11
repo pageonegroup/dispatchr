@@ -260,10 +260,11 @@ app.get("/drive/callback", async (req, res) => {
 });
 
 app.get("/drive/status", authed, requireRole("super_admin"), async (_req, res) => {
+  const configured = !!currentRefreshToken; // a token is still on file (system drop vs. user disconnect)
   try {
     const about = await driveClient().about.get({ fields: "user(emailAddress)" });
-    res.json({ connected: true, account: about.data.user.emailAddress });
-  } catch { res.json({ connected: false }); }
+    res.json({ connected: true, configured, account: about.data.user.emailAddress });
+  } catch { res.json({ connected: false, configured }); }
 });
 
 // Global connection indicator for the top-bar — readable by ANY signed-in user (boolean only).
