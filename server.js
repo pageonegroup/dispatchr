@@ -49,7 +49,9 @@ let currentRefreshToken = GOOGLE_REFRESH_TOKEN || null;
 async function loadRefreshToken() {
   try {
     const { data } = await admin.from("app_secrets").select("value").eq("key", "google_refresh_token").maybeSingle();
-    if (data && data.value) currentRefreshToken = data.value;
+    // If a row exists it's authoritative (empty value = explicitly disconnected). Only when no
+    // row has ever been written do we keep the env-var fallback already in currentRefreshToken.
+    if (data) currentRefreshToken = data.value || null;
   } catch (e) { console.error("[Dispatchr] could not load refresh token:", e.message); }
 }
 async function saveRefreshToken(tok) {
@@ -57,6 +59,15 @@ async function saveRefreshToken(tok) {
   driveStatusCache = { at: 0, connected: false }; // force a fresh check after reconnect
   const { error } = await admin.from("app_secrets")
     .upsert({ key: "google_refresh_token", value: tok, updated_at: new Date().toISOString() }, { onConflict: "key" });
+  if (error) throw error;
+}
+// Explicit disconnect: forget the token (stored as empty so it survives redeploys and
+// overrides any env-var fallback). Drive access stops until the admin reconnects.
+async function clearRefreshToken() {
+  currentRefreshToken = null;
+  driveStatusCache = { at: 0, connected: false };
+  const { error } = await admin.from("app_secrets")
+    .upsert({ key: "google_refresh_token", value: "", updated_at: new Date().toISOString() }, { onConflict: "key" });
   if (error) throw error;
 }
 
@@ -260,6 +271,13 @@ app.get("/drive/connected", authed, async (_req, res) => {
   res.json({ connected: await driveConnected() });
 });
 
+// Explicit disconnect (super admin) — forgets the saved token so the admin can connect a
+// different account cleanly. Does NOT touch any folders or files in Drive.
+app.post("/drive/disconnect", authed, requireRole("super_admin"), async (_req, res) => {
+  try { await clearRefreshToken(); res.json({ ok: true }); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 // ---- ROOT FOLDER management (super admin) --------------------------------
 // Current root (id + name). If none is set yet, adopt an EXISTING "_DISPATCHR" folder if one
 // is already in Drive — search only, nothing is created here (fresh installs stay blank).
@@ -293,15 +311,16 @@ app.post("/drive/root/create", authed, requireRole("super_admin"), async (req, r
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// List folders Dispatchr can see (drive.file scope = folders this app created), for the
-// "Connect Root" picker. Browsing the user's whole Drive would need a broader scope.
+// List TOP-LEVEL folders (directly under My Drive) that Dispatchr can see, for the
+// "Connect Root" picker. A root should be a top folder, not a nested project folder.
+// (drive.file scope = only folders this app created.)
 app.get("/drive/folders", authed, requireRole("super_admin"), async (_req, res) => {
   try {
     const drive = driveClient();
     const out = []; let pageToken;
     do {
       const r = await drive.files.list({
-        q: "mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+        q: "'root' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
         fields: "nextPageToken, files(id, name)",
         pageSize: 100, spaces: "drive", orderBy: "name", pageToken,
       });
