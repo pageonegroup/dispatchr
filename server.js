@@ -109,6 +109,16 @@ async function saveRootFolder(id, name) {
   ], { onConflict: "key" });
   if (error) throw error;
 }
+// Forget the stored root (e.g. after switching Google accounts — a root from one account is
+// meaningless in another). Stored empty so it survives redeploys.
+async function clearRootFolder() {
+  rootFolder = { id: null, name: null };
+  const now = new Date().toISOString();
+  await admin.from("app_secrets").upsert([
+    { key: "drive_root_folder_id", value: "", updated_at: now },
+    { key: "drive_root_folder_name", value: "", updated_at: now },
+  ], { onConflict: "key" });
+}
 // The parent every agency folder is created under: the configured root when set,
 // otherwise the legacy "_DISPATCHR" folder under My Drive — which we then adopt as the
 // stored root so it appears in the UI (ensureFolder finds the existing one, no duplicate).
@@ -275,17 +285,25 @@ app.get("/drive/connected", authed, async (_req, res) => {
 // Explicit disconnect (super admin) — forgets the saved token so the admin can connect a
 // different account cleanly. Does NOT touch any folders or files in Drive.
 app.post("/drive/disconnect", authed, requireRole("super_admin"), async (_req, res) => {
-  try { await clearRefreshToken(); res.json({ ok: true }); }
+  try { await clearRefreshToken(); await clearRootFolder(); res.json({ ok: true }); }
   catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // ---- ROOT FOLDER management (super admin) --------------------------------
-// Current root (id + name). If none is set yet, adopt an EXISTING "_DISPATCHR" folder if one
-// is already in Drive — search only, nothing is created here (fresh installs stay blank).
+// Current root (id + name). Validates the saved root is reachable by the CURRENTLY connected
+// account — if not (e.g. the account was switched), it forgets it and re-detects. If none is
+// set, it adopts an EXISTING "_DISPATCHR" in this account (search only, nothing is created).
 app.get("/drive/root", authed, requireRole("super_admin"), async (_req, res) => {
-  if (rootFolder.id) return res.json({ id: rootFolder.id, name: rootFolder.name });
+  const drive = driveClient();
+  if (rootFolder.id) {
+    try {
+      const meta = await drive.files.get({ fileId: rootFolder.id, fields: "id, name, trashed" });
+      if (meta.data && !meta.data.trashed) return res.json({ id: rootFolder.id, name: meta.data.name || rootFolder.name });
+    } catch (_) { /* not reachable from this account — fall through and forget it */ }
+    try { await clearRootFolder(); } catch (_) {}
+  }
   try {
-    const found = await driveClient().files.list({
+    const found = await drive.files.list({
       q: "name = '_DISPATCHR' and 'root' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
       fields: "files(id, name)", spaces: "drive",
     });
