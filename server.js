@@ -180,6 +180,48 @@ app.get("/drive/storage", authed, requireRole("super_admin"), async (_req, res) 
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// Top projects by Drive space used. Lists every file this account created (drive.file
+// scope = only Dispatchr's own files), sums bytes per project folder, returns the top 20.
+// Super admin only.
+app.get("/drive/top-projects", authed, requireRole("super_admin"), async (_req, res) => {
+  try {
+    const drive = driveClient();
+    // Map each project's Drive folder id -> display name (client + agency projects).
+    const [{ data: projs }, { data: aps }] = await Promise.all([
+      admin.from("projects").select("name, drive_folder_id"),
+      admin.from("agency_projects").select("name, drive_folder_id"),
+    ]);
+    const folderName = {};
+    (projs || []).forEach(p => { if (p.drive_folder_id) folderName[p.drive_folder_id] = p.name; });
+    (aps || []).forEach(p => { if (p.drive_folder_id) folderName[p.drive_folder_id] = p.name; });
+
+    const sizes = {}; // folder id -> total bytes
+    let pageToken;
+    do {
+      const r = await drive.files.list({
+        q: "mimeType != 'application/vnd.google-apps.folder' and trashed = false",
+        fields: "nextPageToken, files(size, parents)",
+        pageSize: 1000,
+        spaces: "drive",
+        pageToken,
+      });
+      for (const f of r.data.files || []) {
+        const sz = Number(f.size || 0);
+        for (const par of (f.parents || [])) {
+          if (folderName[par] != null) { sizes[par] = (sizes[par] || 0) + sz; break; }
+        }
+      }
+      pageToken = r.data.nextPageToken;
+    } while (pageToken);
+
+    const projects = Object.entries(sizes)
+      .map(([fid, bytes]) => ({ project: folderName[fid], bytes }))
+      .sort((a, b) => b.bytes - a.bytes)
+      .slice(0, 20);
+    res.json({ projects });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 // ============================================================
 // USER CREATION (passwords set by an admin/agency, so service-role only)
 // ============================================================
