@@ -126,7 +126,7 @@ async function resolveFolderForFileRow(drive, file) {
 // May the current user manage (add/remove files on) this delivery row? Same gate as the
 // UI edit/delete buttons: an admin, or the person who uploaded it.
 function canManageFileRow(req, file) {
-  return req.user.role === "admin" || file.uploaded_by === req.user.id;
+  return req.user.role === "super_admin" || file.uploaded_by === req.user.id;
 }
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -160,6 +160,24 @@ app.get("/drive/status", authed, requireRole("super_admin"), async (_req, res) =
     const about = await driveClient().about.get({ fields: "user(emailAddress)" });
     res.json({ connected: true, account: about.data.user.emailAddress });
   } catch { res.json({ connected: false }); }
+});
+
+// Storage quota on the connected service account — represents the whole system,
+// since every upload runs through this one Drive account. Super admin only.
+app.get("/drive/storage", authed, requireRole("super_admin"), async (_req, res) => {
+  try {
+    const about = await driveClient().about.get({
+      fields: "storageQuota, user(emailAddress)",
+    });
+    const q = about.data.storageQuota || {};
+    res.json({
+      account: about.data.user?.emailAddress || null,
+      limit:        q.limit ? Number(q.limit) : null,   // null = unlimited/pooled (Workspace)
+      usage:        Number(q.usage || 0),
+      usageInDrive: Number(q.usageInDrive || 0),
+      usageInTrash: Number(q.usageInDriveTrash || 0),
+    });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // ============================================================
