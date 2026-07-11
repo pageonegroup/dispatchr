@@ -177,7 +177,9 @@ app.post("/supplier-users", authed, requireRole("agency"), async (req, res) => {
     res.json({ id, series, name });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
-app.post("/projects/:id/files", authed, upload.single("file"), async (req, res) => {
+// One upload session = ONE file row. All files chosen together are stored as
+// attachments on that single row (they share one description, type, and acknowledgement).
+app.post("/projects/:id/files", authed, upload.array("files", 50), async (req, res) => {
   const projectId = req.params.id;
   const { description, type } = req.body;
   try {
@@ -192,7 +194,7 @@ app.post("/projects/:id/files", authed, upload.single("file"), async (req, res) 
       allowed = !!cl && cl.profile_id === req.user.id;
     }
     if (!allowed) return res.status(403).json({ error: "Not allowed to upload to this project" });
-    if (!req.file) return res.status(400).json({ error: "No file" });
+    if (!req.files || !req.files.length) return res.status(400).json({ error: "No file" });
 
     const { data: project } = await admin.from("projects")
       .select("id, name, start_date, drive_folder_id, agencies(name)").eq("id", projectId).single();
@@ -220,16 +222,21 @@ app.post("/projects/:id/files", authed, upload.single("file"), async (req, res) 
       await admin.from("projects").update({ drive_folder_id: parent }).eq("id", projectId);
     }
 
-    const uploaded = await drive.files.create({
-      requestBody: { name: req.file.originalname, parents: [parent] },
-      media: { mimeType: req.file.mimetype, body: Readable.from(req.file.buffer) },
-      fields: "id, webViewLink",
-    });
+    const attachments = [];
+    for (const file of req.files) {
+      const uploaded = await drive.files.create({
+        requestBody: { name: file.originalname, parents: [parent] },
+        media: { mimeType: file.mimetype, body: Readable.from(file.buffer) },
+        fields: "id, webViewLink",
+      });
+      attachments.push({ id: uploaded.data.id, link: uploaded.data.webViewLink, name: file.originalname });
+    }
+    const first = attachments[0];
 
     const { data: row, error } = await admin.from("files").insert({
-      project_id: projectId, description, type: type || "Others",
-      file_name: req.file.originalname,
-      drive_file_id: uploaded.data.id, drive_link: uploaded.data.webViewLink,
+      project_id: projectId, description: description || first.name, type: type || "Others",
+      file_name: first.name, attachments,
+      drive_file_id: first.id, drive_link: first.link,
       uploaded_by: req.user.id, uploader_role: req.user.role,
     }).select().single();
     if (error) throw error;
@@ -241,11 +248,11 @@ app.post("/projects/:id/files", authed, upload.single("file"), async (req, res) 
 // AGENCY-PROJECT FILE UPLOAD  (the SUPPLIER uploads; the agency acknowledges)
 // Drive tree: _DISPATCHR / [AGENCY] / _SUPPLIERS / [SUPPLIER COMPANY] / [yyyymmdd Project]
 // ============================================================
-app.post("/agency-projects/:id/files", authed, upload.single("file"), async (req, res) => {
+app.post("/agency-projects/:id/files", authed, upload.array("files", 50), async (req, res) => {
   const apId = req.params.id;
   const { description, type } = req.body;
   try {
-    if (!req.file) return res.status(400).json({ error: "No file" });
+    if (!req.files || !req.files.length) return res.status(400).json({ error: "No file" });
     const { data: ap } = await admin.from("agency_projects")
       .select("id, name, start_date, drive_folder_id, supplier_company_id, agencies(name), supplier_companies(name)")
       .eq("id", apId).single();
@@ -279,16 +286,21 @@ app.post("/agency-projects/:id/files", authed, upload.single("file"), async (req
       await admin.from("agency_projects").update({ drive_folder_id: parent }).eq("id", apId);
     }
 
-    const uploaded = await drive.files.create({
-      requestBody: { name: req.file.originalname, parents: [parent] },
-      media: { mimeType: req.file.mimetype, body: Readable.from(req.file.buffer) },
-      fields: "id, webViewLink",
-    });
+    const attachments = [];
+    for (const file of req.files) {
+      const uploaded = await drive.files.create({
+        requestBody: { name: file.originalname, parents: [parent] },
+        media: { mimeType: file.mimetype, body: Readable.from(file.buffer) },
+        fields: "id, webViewLink",
+      });
+      attachments.push({ id: uploaded.data.id, link: uploaded.data.webViewLink, name: file.originalname });
+    }
+    const first = attachments[0];
 
     const { data: row, error } = await admin.from("files").insert({
-      agency_project_id: apId, description, type: type || "Others",
-      file_name: req.file.originalname,
-      drive_file_id: uploaded.data.id, drive_link: uploaded.data.webViewLink,
+      agency_project_id: apId, description: description || first.name, type: type || "Others",
+      file_name: first.name, attachments,
+      drive_file_id: first.id, drive_link: first.link,
       uploaded_by: req.user.id, uploader_role: req.user.role,
     }).select().single();
     if (error) throw error;
@@ -302,7 +314,7 @@ app.post("/agency-projects/:id/files", authed, upload.single("file"), async (req
 app.get("/files/:id/download", authed, async (req, res) => {
   try {
     // can the caller see the parent project? reuse the RLS helpers, called AS the user
-    const { data: file } = await admin.from("files").select("project_id, agency_project_id, file_name, drive_file_id").eq("id", req.params.id).single();
+    const { data: file } = await admin.from("files").select("project_id, agency_project_id, file_name, drive_file_id, attachments").eq("id", req.params.id).single();
     if (!file) return res.status(404).json({ error: "Not found" });
     const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       global: { headers: { Authorization: req.headers.authorization } },
@@ -317,9 +329,17 @@ app.get("/files/:id/download", authed, async (req, res) => {
     }
     if (!ok) return res.status(403).json({ error: "Forbidden" });
 
+    // pick the attachment to stream (a row can hold several files from one upload session)
+    const atts = Array.isArray(file.attachments) && file.attachments.length
+      ? file.attachments
+      : [{ id: file.drive_file_id, name: file.file_name }];
+    let idx = parseInt(req.query.idx, 10);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= atts.length) idx = 0;
+    const att = atts[idx];
+
     const drive = driveClient();
-    const stream = await drive.files.get({ fileId: file.drive_file_id, alt: "media" }, { responseType: "stream" });
-    res.setHeader("Content-Disposition", `attachment; filename="${file.file_name}"`);
+    const stream = await drive.files.get({ fileId: att.id, alt: "media" }, { responseType: "stream" });
+    res.setHeader("Content-Disposition", `attachment; filename="${att.name || file.file_name}"`);
     stream.data.pipe(res);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
