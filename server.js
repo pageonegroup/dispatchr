@@ -387,14 +387,14 @@ app.get("/drive/storage", authed, requireRole("super_admin"), async (_req, res) 
 app.get("/drive/top-projects", authed, requireRole("super_admin"), async (_req, res) => {
   try {
     const drive = driveClient();
-    // Map each project's Drive folder id -> display name (client + agency projects).
+    // Map each project's Drive folder id -> metadata (client + agency projects).
     const [{ data: projs }, { data: aps }] = await Promise.all([
-      admin.from("projects").select("name, drive_folder_id"),
-      admin.from("agency_projects").select("name, drive_folder_id"),
+      admin.from("projects").select("name, drive_folder_id, created_by, created_at"),
+      admin.from("agency_projects").select("name, drive_folder_id, created_by, created_at"),
     ]);
-    const folderName = {};
-    (projs || []).forEach(p => { if (p.drive_folder_id) folderName[p.drive_folder_id] = p.name; });
-    (aps || []).forEach(p => { if (p.drive_folder_id) folderName[p.drive_folder_id] = p.name; });
+    const meta = {}; // folder id -> { name, kind, createdBy, createdAt }
+    (projs || []).forEach(p => { if (p.drive_folder_id) meta[p.drive_folder_id] = { name: p.name, kind: "client", createdBy: p.created_by, createdAt: p.created_at }; });
+    (aps   || []).forEach(p => { if (p.drive_folder_id) meta[p.drive_folder_id] = { name: p.name, kind: "agency", createdBy: p.created_by, createdAt: p.created_at }; });
 
     const sizes = {}; // folder id -> total bytes
     let pageToken;
@@ -409,14 +409,28 @@ app.get("/drive/top-projects", authed, requireRole("super_admin"), async (_req, 
       for (const f of r.data.files || []) {
         const sz = Number(f.size || 0);
         for (const par of (f.parents || [])) {
-          if (folderName[par] != null) { sizes[par] = (sizes[par] || 0) + sz; break; }
+          if (meta[par] != null) { sizes[par] = (sizes[par] || 0) + sz; break; }
         }
       }
       pageToken = r.data.nextPageToken;
     } while (pageToken);
 
+    // Resolve owner display names (service role, past RLS).
+    const ownerIds = [...new Set(Object.keys(sizes).map(fid => meta[fid] && meta[fid].createdBy).filter(Boolean))];
+    const ownerName = {};
+    if (ownerIds.length) {
+      const { data: profs } = await admin.from("profiles").select("id, display_name").in("id", ownerIds);
+      (profs || []).forEach(p => { ownerName[p.id] = p.display_name; });
+    }
+
     const projects = Object.entries(sizes)
-      .map(([fid, bytes]) => ({ project: folderName[fid], bytes }))
+      .map(([fid, bytes]) => ({
+        project:   meta[fid].name,
+        kind:      meta[fid].kind,                       // "client" | "agency"
+        owner:     ownerName[meta[fid].createdBy] || null,
+        createdAt: meta[fid].createdAt || null,
+        bytes,
+      }))
       .sort((a, b) => b.bytes - a.bytes)
       .slice(0, 20);
     res.json({ projects });
