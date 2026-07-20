@@ -37,7 +37,7 @@ const anon = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const app = express();
 app.use(cors({ origin: ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean) }));
 app.use(express.json());
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 // ---------- helpers ----------
 const oauth = () => new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
@@ -1174,6 +1174,13 @@ app.post("/files/:id/unacknowledge", authed, async (req, res) => {
     await admin.from("files").update({ ack_at: null }).eq("id", file.id);
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Reject oversized uploads cleanly (frontend also caps at 20 MB per file)
+app.use((err, req, res, next) => {
+  if (err && err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "Each file must be 20 MB or smaller." });
+  if (err) return res.status(400).json({ error: err.message || "Upload error" });
+  next();
 });
 
 await loadRefreshToken(); // seed the current Google token from the DB before serving
